@@ -1,8 +1,8 @@
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
-from datetime import datetime
+from datetime import datetime, timedelta
 import sqlite3
 import os
 
@@ -54,26 +54,27 @@ async def add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Использование: /add_reminder <ДД.ММ.ГГГГ ЧЧ:ММ> <текст>")
+        await update.message.reply_text("Использование: /add_reminder <время (чч:мм)> <текст>")
         return
 
     try:
-        # Парсим дату и время
-        date_time = " ".join(args[:2])
-        time = datetime.strptime(date_time, "%d.%m.%Y %H:%M")
+        time = datetime.strptime(args[0], "%H:%M").replace(
+            year=datetime.now().year,
+            month=datetime.now().month,
+            day=datetime.now().day
+        )
         if time < datetime.now():
-            await update.message.reply_text("Дата и время должны быть в будущем.")
-            return
-        text = " ".join(args[2:])  # Оставшийся текст
+            time += timedelta(days=1)  # Напоминание на следующий день, если время прошло.
+        text = " ".join(args[1:])
         add_reminder_to_db(user_id, time, text)
         scheduler.add_job(
             send_reminder,
             trigger=DateTrigger(run_date=time),
             args=(user_id, text),
         )
-        await update.message.reply_text(f"Напоминание добавлено на {time.strftime('%d.%m.%Y %H:%M')}: {text}")
+        await update.message.reply_text(f"Напоминание добавлено на {time.strftime('%H:%M')}: {text}")
     except ValueError:
-        await update.message.reply_text("Некорректный формат даты. Используйте ДД.ММ.ГГГГ ЧЧ:ММ.")
+        await update.message.reply_text("Некорректное время. Используйте формат чч:мм.")
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -84,7 +85,7 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [
-            InlineKeyboardButton(f"{time[:16]} — {text[:20]}...", callback_data=f"delete_{reminder_id}")
+            InlineKeyboardButton(f"{time} — {text[:20]}...", callback_data=f"delete_{reminder_id}")
         ]
         for reminder_id, time, text in reminders
     ]
