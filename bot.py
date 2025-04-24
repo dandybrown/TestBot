@@ -1,17 +1,11 @@
 import os
 import sqlite3
 import logging
-from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.jobstores.base import JobLookupError
 from pytz import timezone
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Логи
 logging.basicConfig(
@@ -19,9 +13,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Константы из окружения
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# Переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Токен вашего бота
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Telegram user ID администратора
 TZ = timezone("Europe/Amsterdam")
 DB_PATH = "bot_db.sqlite"
 
@@ -77,28 +71,47 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось отправить {uid}: {e}")
     await update.message.reply_text(f"Рассылка отправлена {count} пользователям.")
 
-# Функция ежедневного приветствия
-def schedule_jobs(app: ApplicationBuilder):
+# Новый обработчик для пересылки сообщений админу
+async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    message = update.message
+
+    if message.text:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"Сообщение от пользователя {user_id}:\n\n{message.text}"
+        )
+    elif message.photo:
+        photo_file_id = message.photo[-1].file_id
+        await context.bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=photo_file_id,
+            caption=f"Фото от пользователя {user_id}"
+        )
+    elif message.document:
+        await context.bot.send_document(
+            chat_id=ADMIN_ID,
+            document=message.document.file_id,
+            caption=f"Файл от пользователя {user_id}"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"Сообщение от пользователя {user_id}: [неизвестный тип сообщения]"
+        )
+
+# Планировщик ежедневного приветствия
+def schedule_jobs(app):
     scheduler = BackgroundScheduler(timezone=TZ)
-    # Каждый день в 08:00 Europe/Amsterdam
-    trigger = CronTrigger(hour=8, minute=0, timezone=TZ)
-    scheduler.add_job(
-        func=lambda: app.bot.send_message(
-            chat_id=uid, text="Доброе утро! ☀️"
-        ) or None,
-        trigger=trigger,
-        args=[],
-        id="daily_good_morning",
-        replace_existing=True
-    )
-    # Чтобы отправлять всем подписчикам, обёрнём чуть иначе:
     def job_all():
         for uid in get_all_subscribers():
             try:
                 app.bot.send_message(chat_id=uid, text="Доброе утро! ☀️")
             except Exception as e:
                 logger.warning(f"Ошибка при рассылке {uid}: {e}")
-    scheduler.reschedule_job("daily_good_morning", trigger=trigger, func=job_all)
+
+    trigger = CronTrigger(hour=8, minute=0, timezone=TZ)
+    scheduler.add_job(job_all, trigger=trigger, id="daily_good_morning", replace_existing=True)
     scheduler.start()
     logger.info("Планировщик запущен.")
 
@@ -109,8 +122,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(MessageHandler(filters.ALL, forward_to_admin))  # Новый обработчик для пересылки
 
-    # Ждём, пока бот поднимется, и настраиваем задачи
     schedule_jobs(app)
 
     logger.info("Бот запущен.")
