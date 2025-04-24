@@ -1,131 +1,120 @@
-import os
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+from datetime import datetime
 import sqlite3
-import logging
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+import os
 
-# Логи
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Переменные окружения
+# Базовая конфигурация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "reminders_db.sqlite"
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB_PATH = "bot_db.sqlite"
+scheduler = BackgroundScheduler()
 
-# Инициализация БД
+# Инициализация базы данных
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            reminder TEXT,
-            time TEXT,
-            PRIMARY KEY (user_id, reminder, time)
+            time DATETIME,
+            text TEXT
         );
     """)
     conn.commit()
     conn.close()
 
-def add_reminder(user_id: int, reminder: str, time: str):
+def add_reminder_to_db(user_id: int, time: datetime, text: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO reminders (user_id, reminder, time) VALUES (?, ?, ?);", (user_id, reminder, time))
+    cur.execute("INSERT INTO reminders (user_id, time, text) VALUES (?, ?, ?)", (user_id, time, text))
     conn.commit()
     conn.close()
 
-def get_reminders(user_id: int):
+def get_user_reminders(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT reminder, time FROM reminders WHERE user_id = ?;", (user_id,))
+    cur.execute("SELECT id, time, text FROM reminders WHERE user_id = ?", (user_id,))
     reminders = cur.fetchall()
     conn.close()
     return reminders
 
-def delete_reminder(user_id: int, reminder: str, time: str):
+def delete_reminder(reminder_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("DELETE FROM reminders WHERE user_id = ? AND reminder = ? AND time = ?;", (user_id, reminder, time))
+    cur.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
     conn.commit()
     conn.close()
 
-# Обработчики
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Добро пожаловать! Вы можете добавлять напоминания с помощью команды /remind "
-        "и управлять ими через меню /menu."
-    )
-
-async def add_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработчики команд
+async def add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Использование: /add_reminder <ДД.ММ.ГГГГ ЧЧ:ММ> <текст>")
+        return
+
     try:
-        time_str = context.args[0]
-        reminder = " ".join(context.args[1:])
-        reminder_time = datetime.strptime(time_str, "%H:%M")
-        now = datetime.now()
-        if reminder_time < now.time():
-            reminder_time += timedelta(days=1)  # Напоминание на следующий день
-
-        add_reminder(user_id, reminder, time_str)
-        await context.job_queue.run_once(
-            send_reminder, 
-            when=(reminder_time - now).seconds, 
-            context={"user_id": user_id, "reminder": reminder}
+        # Парсим дату и время
+        date_time = " ".join(args[:2])
+        time = datetime.strptime(date_time, "%d.%m.%Y %H:%M")
+        if time < datetime.now():
+            await update.message.reply_text("Дата и время должны быть в будущем.")
+            return
+        text = " ".join(args[2:])  # Оставшийся текст
+        add_reminder_to_db(user_id, time, text)
+        scheduler.add_job(
+            send_reminder,
+            trigger=DateTrigger(run_date=time),
+            args=(user_id, text),
         )
-        await update.message.reply_text(f"Напоминание установлено: {reminder} в {time_str}.")
-    except (IndexError, ValueError):
-        await update.message.reply_text("Использование: /remind <HH:MM> <текст напоминания>")
+        await update.message.reply_text(f"Напоминание добавлено на {time.strftime('%d.%m.%Y %H:%M')}: {text}")
+    except ValueError:
+        await update.message.reply_text("Некорректный формат даты. Используйте ДД.ММ.ГГГГ ЧЧ:ММ.")
 
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.context
-    user_id = job_data["user_id"]
-    reminder = job_data["reminder"]
-    await context.bot.send_message(chat_id=user_id, text=f"Напоминание: {reminder}")
-
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    reminders = get_reminders(user_id)
+    reminders = get_user_reminders(user_id)
     if not reminders:
-        return await update.message.reply_text("У вас нет установленных напоминаний.")
+        await update.message.reply_text("У вас нет напоминаний.")
+        return
 
     keyboard = [
-        [InlineKeyboardButton(f"{time} - {reminder}", callback_data=f"delete_{time}_{reminder}")]
-        for reminder, time in reminders
+        [
+            InlineKeyboardButton(f"{time[:16]} — {text[:20]}...", callback_data=f"delete_{reminder_id}")
+        ]
+        for reminder_id, time, text in reminders
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Ваши напоминания:", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "Ваши напоминания:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[1])
+    delete_reminder(reminder_id)
+    await query.edit_message_text("Напоминание удалено.")
 
-    if query.data.startswith("delete_"):
-        _, time, reminder = query.data.split("_", 2)
-        delete_reminder(user_id, reminder, time)
-        await query.edit_message_text(f"Напоминание удалено: {reminder} в {time}.")
+# Отправка напоминания
+async def send_reminder(user_id: int, text: str):
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    await application.bot.send_message(chat_id=user_id, text=f"Напоминание: {text}")
 
 # Точка входа
 def main():
     init_db()
+    scheduler.start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("add_reminder", add_reminder))
+    app.add_handler(CommandHandler("list_reminders", list_reminders))
+    app.add_handler(CallbackQueryHandler(delete_reminder_callback, pattern="delete_.*"))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("remind", add_reminder_command))
-    app.add_handler(CommandHandler("menu", show_menu))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    logger.info("Бот запущен.")
     app.run_polling()
 
 if __name__ == "__main__":
